@@ -51,6 +51,7 @@ public class MirrorSourceTask extends SourceTask {
     private static final Logger log = LoggerFactory.getLogger(MirrorSourceTask.class);
 
     private KafkaConsumer<byte[], byte[]> consumer;
+    private final Map<TopicPartition, Long> expectedNextOffsets = new java.util.HashMap<>();
     private String sourceClusterAlias;
     private Duration pollTimeout;
     private ReplicationPolicy replicationPolicy;
@@ -88,6 +89,7 @@ public class MirrorSourceTask extends SourceTask {
             offsetSyncWriter = new OffsetSyncWriter(config);
         }
         consumer = MirrorUtils.newConsumer(config.sourceConsumerConfig("replication-consumer"));
+        expectedNextOffsets.clear();
         Set<TopicPartition> taskTopicPartitions = config.taskTopicPartitions();
         initializeConsumer(taskTopicPartitions);
 
@@ -138,25 +140,56 @@ public class MirrorSourceTask extends SourceTask {
             return null;
         }
         try {
-            ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
-            List<SourceRecord> sourceRecords = new ArrayList<>(records.count());
-            for (ConsumerRecord<byte[], byte[]> record : records) {
-                SourceRecord converted = convertRecord(record);
-                sourceRecords.add(converted);
-                TopicPartition topicPartition = new TopicPartition(converted.topic(), converted.kafkaPartition());
-                long age = System.currentTimeMillis() - record.timestamp();
-                long size = byteSize(record.value());
-                if (legacyMetrics != null) {
-                    legacyMetrics.recordAge(topicPartition, age);
-                    legacyMetrics.recordBytes(topicPartition, size);
+            ConsumerRecords<byte[], byte[]> records;
+            try {
+                records = consumer.poll(pollTimeout);
+            } catch (org.apache.kafka.clients.consumer.OffsetOutOfRangeException e) {
+                // Task 3: Graceful Topic Reset Handling
+                Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(e.offsetOutOfRangePartitions().keySet());
+                for (TopicPartition tp : e.offsetOutOfRangePartitions().keySet()) {
+                    if (beginningOffsets.getOrDefault(tp, 0L) > 0) {
+                        log.error("[TRUNCATION DETECTED] Partitions: {} - Earliest offset: {} - Data loss detected due to log retention.", 
+                            tp, beginningOffsets.get(tp));
+                        throw new KafkaException("[TRUNCATION DETECTED] Data loss on " + tp);
+                    }
                 }
-                if (metrics != null) {
-                    metrics.recordAge(topicPartition, age);
-                    metrics.recordBytes(topicPartition, size);
+                log.warn("[TOPIC RESET DETECTED] Partitions: {} - Seeking to beginning for auto-recovery.", e.offsetOutOfRangePartitions().keySet());
+                consumer.seekToBeginning(e.offsetOutOfRangePartitions().keySet());
+                e.offsetOutOfRangePartitions().keySet().forEach(expectedNextOffsets::remove);
+                return java.util.Collections.emptyList();
+            }
+
+            List<SourceRecord> sourceRecords = new ArrayList<>(records.count());
+            for (TopicPartition tp : records.partitions()) {
+                List<ConsumerRecord<byte[], byte[]>> partitionRecords = records.records(tp);
+                long firstOffset = partitionRecords.get(0).offset();
+                long lastOffset = partitionRecords.get(partitionRecords.size() - 1).offset();
+
+                // Task 2: Log Truncation Detection (Fail-Fast)
+                long expected = expectedNextOffsets.getOrDefault(tp, firstOffset);
+                if (firstOffset > expected) {
+                    log.error("[TRUNCATION DETECTED] Partition: {} — Expected offset: {}, Got: {}. Data loss detected.", 
+                        tp, expected, firstOffset);
+                    throw new KafkaException("[TRUNCATION DETECTED] Data loss on " + tp);
+                }
+                expectedNextOffsets.put(tp, lastOffset + 1);
+
+                for (ConsumerRecord<byte[], byte[]> record : partitionRecords) {
+                    SourceRecord converted = convertRecord(record);
+                    sourceRecords.add(converted);
+                    long age = System.currentTimeMillis() - record.timestamp();
+                    long size = byteSize(record.value());
+                    if (legacyMetrics != null) {
+                        legacyMetrics.recordAge(tp, age);
+                        legacyMetrics.recordBytes(tp, size);
+                    }
+                    if (metrics != null) {
+                        metrics.recordAge(tp, age);
+                        metrics.recordBytes(tp, size);
+                    }
                 }
             }
             if (sourceRecords.isEmpty()) {
-                // WorkerSourceTasks expects non-zero batch size
                 return null;
             } else {
                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
@@ -165,11 +198,9 @@ public class MirrorSourceTask extends SourceTask {
         } catch (WakeupException e) {
             return null;
         } catch (KafkaException e) {
-            log.warn("Failure during poll.", e);
-            return null;
+            throw e;
         } catch (Throwable e)  {
             log.error("Failure during poll.", e);
-            // allow Connect to deal with the exception
             throw e;
         } finally {
             consumerAccess.release();
