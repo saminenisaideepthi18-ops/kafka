@@ -148,12 +148,12 @@ public class MirrorSourceTask extends SourceTask {
                 Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(e.offsetOutOfRangePartitions().keySet());
                 for (TopicPartition tp : e.offsetOutOfRangePartitions().keySet()) {
                     if (beginningOffsets.getOrDefault(tp, 0L) > 0) {
-                        log.error("[TRUNCATION DETECTED] Partitions: {} — Earliest offset is {}. Data loss detected.", 
+                        log.error("[TRUNCATION DETECTED] Partitions: {} - Earliest offset: {} - Data loss detected due to log retention.", 
                             tp, beginningOffsets.get(tp));
                         throw new KafkaException("[TRUNCATION DETECTED] Data loss on " + tp);
                     }
                 }
-                log.warn("[TOPIC RESET DETECTED] Partitions: {} — Seeking to beginning for auto-recovery.", e.offsetOutOfRangePartitions().keySet());
+                log.warn("[TOPIC RESET DETECTED] Partitions: {} - Seeking to beginning for auto-recovery.", e.offsetOutOfRangePartitions().keySet());
                 consumer.seekToBeginning(e.offsetOutOfRangePartitions().keySet());
                 e.offsetOutOfRangePartitions().keySet().forEach(expectedNextOffsets::remove);
                 return java.util.Collections.emptyList();
